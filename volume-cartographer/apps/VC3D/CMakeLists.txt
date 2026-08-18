@@ -35,6 +35,8 @@ set(srcs
     FiberSliceGeometry.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
+    LineAnnotationFiberSegments.cpp
+    LineAnnotationFiberSegments.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
@@ -91,6 +93,10 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/DownloadQueueStats.cpp
+    elements/DownloadQueueStats.hpp
+    elements/DownloadQueueDebugOverlay.cpp
+    elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
     RemoteVolumeCachePaths.cpp
@@ -198,13 +204,20 @@ set(srcs
     LasagnaServiceManager.hpp
     SpiralArtifactCache.cpp
     SpiralArtifactCache.hpp
+    SpiralBrushController.cpp
+    SpiralBrushController.hpp
+    SpiralPointChain.cpp
+    SpiralPointChain.hpp
     SpiralServiceManager.cpp
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp
+    SpiralSessionSync.hpp
     SpiralSshTunnel.cpp
     SpiralSshTunnel.hpp
     SpiralPanel.cpp
     SpiralPanel.hpp
+    SpiralMinimap.cpp
+    SpiralMinimap.hpp
     SpiralWorkspace.cpp
     SpiralWorkspace.hpp
     LasagnaBatchWindow.cpp
@@ -329,6 +342,7 @@ target_link_libraries(VC3D
     vc_core
     vc_atlas
     vc_lasagna
+    vc_fiber_tracer
     vc_tracer
     vc_flattening
     Ceres::ceres
@@ -401,5 +415,16 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
     DESTINATION share/volume-cartographer/spiral
     FILES_MATCHING
         PATTERN "*.py"
+        PATTERN "*.json"
         PATTERN "tests" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+
+set(_vc3d_fiber_format_src
+    "${CMAKE_SOURCE_DIR}/../vesuvius/src/vc3d_fiber_format")
+if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
+    install(DIRECTORY "${_vc3d_fiber_format_src}"
+        DESTINATION share/volume-cartographer/spiral
+        FILES_MATCHING
+            PATTERN "*.py"
+            PATTERN "__pycache__" EXCLUDE)
+endif()

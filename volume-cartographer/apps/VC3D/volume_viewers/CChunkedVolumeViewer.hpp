@@ -50,7 +50,11 @@ class ViewerStatsBar;
 class VCCollection;
 class Volume;
 
-namespace vc::render { class ChunkCache; }
+namespace vc::render {
+class ChunkCache;
+class SurfaceCache;
+class SurfaceGeometryTileCache;
+}
 
 class CChunkedVolumeViewer : public QWidget, public VolumeViewerBase
 {
@@ -187,10 +191,28 @@ public:
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override;
+    std::uint64_t surfaceOverlaysRevision() const override { return _surfaceOverlaysRevision; }
     float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
-    void setSurfaceOverlayEnabled(bool enabled) override { if (_closing) return; _surfaceOverlayEnabled = enabled; emit overlaysUpdated(); }
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override { if (_closing) return; _surfaceOverlays = overlays; emit overlaysUpdated(); }
-    void setSurfaceOverlapThreshold(float threshold) override { if (_closing) return; _surfaceOverlapThreshold = std::max(0.0f, threshold); emit overlaysUpdated(); }
+    void setSurfaceOverlayEnabled(bool enabled) override
+    {
+        if (_closing || _surfaceOverlayEnabled == enabled) return;
+        _surfaceOverlayEnabled = enabled;
+        emit overlaysUpdated();
+    }
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override
+    {
+        if (_closing || _surfaceOverlays == overlays) return;
+        _surfaceOverlays = overlays;
+        ++_surfaceOverlaysRevision;
+        emit overlaysUpdated();
+    }
+    void setSurfaceOverlapThreshold(float threshold) override
+    {
+        const float clamped = std::max(0.0f, threshold);
+        if (_closing || _surfaceOverlapThreshold == clamped) return;
+        _surfaceOverlapThreshold = clamped;
+        emit overlaysUpdated();
+    }
 
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
@@ -207,7 +229,26 @@ public:
     bool isMeasurementActive() const;
     void clearMeasurement();
     void markSurfaceGeometryChanged();
+    // Geometry-epoch introspection: lets callers tell whether the currently
+    // DISPLAYED frame was rendered from the current surface geometry (stale
+    // in-flight frames adopt with an older epoch).
+    std::uint64_t surfaceGeometryEpoch() const { return _surfaceGeometryEpoch; }
+    std::uint64_t displayedSurfaceGeometryEpoch() const
+    {
+        return _displayedRenderJob ? _displayedRenderJob->surfaceGeometryEpoch : 0;
+    }
     void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
+    // Accept linked-cursor points regardless of the global "Sync cursor across
+    // views" toggle (used by the line annotation window's pane group, whose
+    // mirroring is dialog-local).
+    void setLinkedCursorAlwaysEnabled(bool enabled) { _linkedCursorAlwaysEnabled = enabled; }
+    // Reject linked-cursor points outright, overriding both of the above. The
+    // line annotation window needs this to keep mirrored crosses out of its
+    // panes while the global toggle is on.
+    void setLinkedCursorMirroringSuppressed(bool suppressed)
+    {
+        _linkedCursorMirroringSuppressed = suppressed;
+    }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
     QObject* asQObject() override { return this; }
@@ -217,13 +258,17 @@ public:
     }
 
     void reloadPerfSettings() override;
+    void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
     void showEvent(QShowEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
+    // Thin guard around onSurfaceChangedImpl; see the definition for why the
+    // lazy surface load has to be contained before it reaches Qt.
     void onSurfaceChanged(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate = false);
     void onSurfaceWillBeDeleted(const std::string& name, const std::shared_ptr<Surface>& surf);
     void onVolumeClosing();
@@ -286,13 +331,22 @@ private:
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
     void updateStatusLabel();
+    void repositionStatsBarRight();
+    void notifyNormalOffsetChanged();
+    void setZOffset(float value);
     void rebuildChunkArray();
+    void refreshDownloadQueueDebugOverlay();
     void clearDisplayedFramebuffer();
     void syncCameraTransform();
     void requestDirectPaint();
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
+    // Build/drop the base and overlay SurfaceCache to match the current
+    // (volume, surface, geometry epoch) identity and the configured budgets.
+    void ensureSurfaceCaches();
+    void dropSurfaceCaches();
+    void dropOverlaySurfaceCache();
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
     // Multiply the current scale by `factor` (clamped to [kMinScale, kMaxScale]),
@@ -307,6 +361,8 @@ private:
     struct GeneratedSurfaceCache;
     struct PendingRenderJob {
         std::uint64_t requestId = 0;
+        vc::render::ChunkRequestContext chunkRequest;
+        std::array<float, 2> renderFocus{};
         int fbW = 0;
         int fbH = 0;
         float surfacePtrX = 0.0f;
@@ -334,6 +390,12 @@ private:
         OverlayCompositeSettings overlayComposite;
         std::uint64_t chunkContentEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
+        // Null unless this is a flattened view with a live SurfaceCache. The
+        // epoch changes whenever a cache is rebuilt, so a carried-forward
+        // previous frame is never mixed with a different cache's samples.
+        std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
+        std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
+        std::uint64_t surfaceCacheEpoch = 0;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
         bool genCacheDirty = false;
         std::string profileReason;
@@ -362,18 +424,21 @@ private:
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
-    void maybeDegradeForCachePressure(const RenderResult& result);
     void markInteractiveMotion(double motionPx);
+    void markChunkRequestViewActive();
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void refreshCursorPositionAt(const QPointF& scenePos);
-    void updateCursorCrosshair(const QPointF& scenePos);
+    // projected=true draws the greyed-out variant used when a linked cursor
+    // point lies off this pane's plane (e.g. after a normal-offset scroll).
+    void updateCursorCrosshair(const QPointF& scenePos, bool projected = false);
     void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
     void clearLineAnnotationPlacementMarker();
     bool handleMeasurementClick(const QPointF& scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void refreshMeasurementOverlay();
+    void onSurfaceChangedImpl(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate);
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
     std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);
@@ -390,6 +455,7 @@ private:
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
+    ViewerStatsBar* _statsBarRight = nullptr;
     // No per-viewer timers. ViewerManager's global clock only services
     // intersection/status maintenance; render requests submit immediately.
     bool _closing = false;
@@ -403,6 +469,10 @@ private:
     bool _deferSegmentationIntersections = false;
     bool _deferredSegmentationIntersectionsDirty = false;
     bool _suppressNextSurfaceEditRender = false;
+    // An editing tool can invalidate all tiles or a precise region before it
+    // emits a same-object surfaceChanged signal. Consume that fact at the
+    // signal so regional invalidation is not widened to the whole surface.
+    bool _surfaceEditInvalidationPending = false;
     std::string _pendingRenderReason;
     std::string _pendingRenderCaller;
     std::string _pendingIntersectionReason;
@@ -414,6 +484,7 @@ private:
     std::string _surfName;
     std::shared_ptr<vc::render::ChunkCache> _chunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _chunkCbId = 0;
+    std::uint64_t _chunkRemoteFetchCbId = 0;
 
     QImage _framebuffer;
     std::atomic<bool> _renderWorkerBusy{false};
@@ -426,6 +497,8 @@ private:
     std::shared_ptr<RenderResult> _lastRenderResult;
     bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
+    std::uint64_t _chunkViewId = 0;
+    bool _haveChunkFocus = false;
     std::uint64_t _chunkContentEpoch = 0;
     std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _renderSerial = 0;
@@ -434,15 +507,32 @@ private:
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
 
+    // --- SurfaceCache (flattened view only) ---
+    // Tiles of resampled surface space. Present only when the app-wide
+    // per-workspace budget is non-zero and this viewer shows a QuadSurface
+    // segmentation; a null cache means the legacy render path is used.
+    std::shared_ptr<vc::render::SurfaceCache> _surfaceCache;
+    std::shared_ptr<vc::render::SurfaceCache> _overlaySurfaceCache;
+    std::shared_ptr<vc::render::SurfaceGeometryTileCache> _surfaceGeometryTiles;
+    std::size_t _surfaceCacheBudgetBytes = 0;
+    std::size_t _overlaySurfaceCacheBudgetBytes = 0;
+    // Identity the live caches were built for.
+    Volume* _surfaceCacheVolume = nullptr;
+    Surface* _surfaceCacheSurface = nullptr;
+    std::uint64_t _surfaceCacheGeometryEpoch = 0;
+    Volume* _overlaySurfaceCacheVolume = nullptr;
+    std::uint64_t _surfaceCacheEpoch = 0;
+    std::uint64_t _surfaceTileCbId = 0;
+    std::uint64_t _overlaySurfaceTileCbId = 0;
+    // Last frame fell outside the stored band and used the legacy path, so the
+    // status bar can make that performance cliff legible.
+    bool _surfaceCacheOutOfBand = false;
+
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;
     float _scale = 1.0f;
     float _dsScale = 1.0f;
     int _dsScaleIdx = 0;
-    // Extra pyramid levels applied on top of _dsScaleIdx when the shared
-    // chunk cache reports view-protection stalls (live working set larger
-    // than capacity). Reset when the zoom crosses a level boundary.
-    int _cachePressureLevelBias = 0;
     float _zOff = 0.0f;
     float _camSurfX = 0.0f;
     float _camSurfY = 0.0f;
@@ -455,6 +545,8 @@ private:
     std::shared_ptr<Volume> _overlayVolume;
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
+    std::uint64_t _overlayRemoteFetchCbId = 0;
+    std::atomic<std::uint64_t> _overlayGeneration{1};
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
@@ -479,6 +571,7 @@ private:
     bool _surfaceOverlayEnabled = false;
     bool _initializedFirstSegmentationSurface = false;
     std::map<std::string, cv::Vec3b> _surfaceOverlays;
+    std::uint64_t _surfaceOverlaysRevision = 0;
     float _surfaceOverlapThreshold = 5.0f;
     float _intersectionOpacity = 0.7f;
     float _intersectionThickness = 0.0f;
@@ -524,6 +617,7 @@ private:
         size_t targetGenerationHash = 0;
         size_t activeSegHash = 0;
         size_t highlightedSurfaceHash = 0;
+        int segNormalOffsetQ = 0;
         size_t flattenedPlanesHash = 0;
         size_t cameraHash = 0;
         bool valid = false;
@@ -589,15 +683,21 @@ private:
     QPointF _lastPanSceneF;
     QPointF _lastScenePos;
     std::optional<cv::Vec3f> _lastCursorVolumePos;
+    // Cursor point mirrored in from another viewer; display-only fallback for
+    // the status-bar position readout (never used for click/hit-test paths).
+    std::optional<cv::Vec3f> _linkedCursorVolumePos;
     ShiftScrollOverride _shiftScrollOverride;
 
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
+    bool _cursorCrosshairProjected = false;
     QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
     bool _segmentationCursorMirroring = false;
+    bool _linkedCursorAlwaysEnabled = false;
+    bool _linkedCursorMirroringSuppressed = false;
 
     struct MeasurementPoint {
         cv::Vec2f surface{0.0f, 0.0f};

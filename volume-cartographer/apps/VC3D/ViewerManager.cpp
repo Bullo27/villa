@@ -209,6 +209,10 @@ ViewerManager::ViewerManager(CState* state,
     _intersectionThickness = std::max(0.0f, storedThickness);
     _intersectionMaxSurfaces = viewer::INTERSECTION_MAX_SURFACES_DEFAULT;
 
+    // Derived surface tiles are workspace-local, while their decoded volume
+    // chunks come from the application-wide cache service.
+    applyViewerCacheSettings();
+
     _surfacePatchIndexWatcher =
         new QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>(this);
     connect(_surfacePatchIndexWatcher,
@@ -259,6 +263,36 @@ ViewerManager::~ViewerManager()
 const std::vector<ViewerManager*>& ViewerManager::allManagers()
 {
     return managerRegistry();
+}
+
+void ViewerManager::applyViewerCacheSettings()
+{
+    using namespace vc3d::settings;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    constexpr std::size_t mib = 1024ULL * 1024ULL;
+    constexpr std::size_t gib = 1024ULL * mib;
+    const auto surfaceGb = std::max<qlonglong>(
+        0, settings.value(viewer_cache::SURFACE_CACHE_GB,
+                          viewer_cache::SURFACE_CACHE_GB_DEFAULT).toLongLong());
+    const auto overlayGb = std::max<qlonglong>(
+        0, settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
+                          viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
+
+    setSurfaceCacheBudgets(std::size_t(surfaceGb) * gib, std::size_t(overlayGb) * gib);
+}
+
+void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes)
+{
+    if (_surfaceCacheBudgetBytes == baseBytes &&
+        _overlaySurfaceCacheBudgetBytes == overlayBytes) {
+        return;
+    }
+    _surfaceCacheBudgetBytes = baseBytes;
+    _overlaySurfaceCacheBudgetBytes = overlayBytes;
+    forEachBaseViewer([baseBytes, overlayBytes](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->setSurfaceCacheBudgets(baseBytes, overlayBytes);
+    });
 }
 
 void ViewerManager::onGlobalTick()
@@ -392,6 +426,8 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
+    baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
+                                       _overlaySurfaceCacheBudgetBytes);
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);
@@ -405,7 +441,6 @@ void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
     if (!viewer) {
         return;
     }
-
     const auto viewerIt = std::find(_baseViewers.begin(), _baseViewers.end(), viewer);
     const bool knownViewer = viewerIt != _baseViewers.end() ||
                              _resetDefaults.find(viewer) != _resetDefaults.end();
@@ -597,6 +632,36 @@ void ViewerManager::handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surf
         return;
     }
 
+    if ((modifiers & Qt::ControlModifier) && (modifiers & Qt::ShiftModifier) &&
+        button == Qt::LeftButton) {
+        // Ctrl+Shift+click: like Ctrl+click, but if a patch lies under the
+        // clicked point, activate it first so the flattened view navigates on
+        // the right segment. Slice views only — there `surf` is the plane; the
+        // flattened segmentation view reports the quad surface itself.
+        if (!dynamic_cast<PlaneSurface*>(surf)) {
+            return;
+        }
+        if (auto* patchIndex = surfacePatchIndexIfReady()) {
+            static constexpr float kPatchPickToleranceVoxels = 10.0f;
+            SurfacePatchIndex::PointQuery query;
+            query.worldPoint = volLoc;
+            query.tolerance = kPatchPickToleranceVoxels;
+            if (const auto hit = patchIndex->locate(query)) {
+                const auto current = std::dynamic_pointer_cast<QuadSurface>(
+                    _state ? _state->surface("segmentation") : nullptr);
+                if (hit->surface && hit->surface != current &&
+                    !hit->surface->id.empty()) {
+                    emit surfaceActivationRequested(hit->surface->id);
+                }
+            }
+        }
+        std::string surfId;
+        if (_state && surf) {
+            surfId = _state->findSurfaceId(surf);
+        }
+        centerFocusAt(volLoc, normal, surfId);
+        return;
+    }
     if (modifiers & Qt::ShiftModifier) {
         // Reserved for point tools.
         return;
@@ -915,6 +980,30 @@ void ViewerManager::setSegmentationOverlay(SegmentationOverlayController* overla
 {
     _segmentationOverlay = overlay;
     registerOverlay(overlay);
+}
+
+void ViewerManager::scheduleSurfacePatchIndexOverlayRefresh()
+{
+    if (!_segmentationOverlay || _surfacePatchIndexOverlayRefreshPending) {
+        return;
+    }
+
+    // Surface-overlap queries can legitimately run before an asynchronous
+    // index rebuild has installed their target surfaces. In that case the
+    // controller caches an empty result. Retry after every completed index
+    // mutation so that result does not remain empty indefinitely.
+    //
+    // Queue this instead of refreshing synchronously: an index swap can occur
+    // inside SegmentationOverlayController::endIndexRead(), while its previous
+    // overlap result is still being finalized. A direct callback there would
+    // re-enter and overwrite the controller's in-flight request state.
+    _surfacePatchIndexOverlayRefreshPending = true;
+    QTimer::singleShot(0, this, [this]() {
+        _surfacePatchIndexOverlayRefreshPending = false;
+        if (_segmentationOverlay) {
+            _segmentationOverlay->forceRefreshAllOverlays();
+        }
+    });
 }
 
 void ViewerManager::setSegmentationEditActive(bool active)
@@ -1278,6 +1367,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (_surfacePatchIndex.updateSurface(surface)) {
         _indexedSurfaceIds.insert(surfId);
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Rebuilt SurfacePatchIndex entries for surface" << surfId.c_str();
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1320,6 +1410,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Updated SurfacePatchIndex region for" << surfId.c_str()
                                 << "rows" << rowStart << "-" << rowEnd
                                 << "cols" << colStart << "-" << colEnd;
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1371,6 +1462,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1422,6 +1514,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
                 v->invalidateIntersect();
                 v->renderIntersections("surface index cache hit");
             });
+            scheduleSurfacePatchIndexOverlayRefresh();
             return;
         }
         // Entry went stale (surfaces reloaded, deleted, or stride changed);
@@ -1479,6 +1572,7 @@ void ViewerManager::endIndexRead()
         _indexedSurfaceIds.insert(_deferredIndexSwapIds.begin(), _deferredIndexSwapIds.end());
         _deferredIndexSwapIds.clear();
         forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections("deferred index swap"); });
+        scheduleSurfacePatchIndexOverlayRefresh();
     }
     // Run any single-surface mutation task that was held while reads were in flight.
     startNextSurfacePatchIndexTask();
@@ -1526,6 +1620,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     // require another full rebuild. Apply just those deltas on the worker.
     if (queuedDuringRebuild.empty()) {
         forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections(); });
+        scheduleSurfacePatchIndexOverlayRefresh();
     } else {
         forEachBaseViewer([](VolumeViewerBase* v) { v->invalidateIntersect(); });
         for (auto& task : queuedDuringRebuild) {
@@ -1613,6 +1708,15 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished()
     }
 
     const auto result = _surfacePatchIndexTaskWatcher->future().result();
+    if (_surfacePatchIndexNeedsRebuild) {
+        // A bulk surface replacement superseded this serialized delta while it
+        // was running. The task mutated only the outgoing live index; rebuild
+        // once from the final state and do not render the transient result.
+        _indexedSurfaceIds.clear();
+        primeSurfacePatchIndicesAsync();
+        return;
+    }
+
     if (result.success) {
         if (result.type == SurfacePatchIndexTaskType::Update) {
             _indexedSurfaceIds.insert(result.id);
@@ -1628,6 +1732,7 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished()
                 v->renderIntersections();
             });
         }
+        scheduleSurfacePatchIndexOverlayRefresh();
     } else if (result.type == SurfacePatchIndexTaskType::Update) {
         _indexedSurfaceIds.erase(result.id);
         _surfacePatchIndexNeedsRebuild = true;
@@ -1670,6 +1775,7 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
+            scheduleSurfacePatchIndexOverlayRefresh();
         }
         _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
         return flushed;
@@ -1699,11 +1805,53 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     }
 
     _surfacePatchIndexNeedsRebuild = true;
+    schedulePrimeSurfacePatchIndices();
     return true;
+}
+
+void ViewerManager::schedulePrimeSurfacePatchIndices()
+{
+    if (_surfacePatchIndexPrimeQueued) {
+        return;
+    }
+    _surfacePatchIndexPrimeQueued = true;
+    // One prime per event-loop turn, over the final surface set.
+    QMetaObject::invokeMethod(this, [this]() {
+        _surfacePatchIndexPrimeQueued = false;
+        if (_surfacePatchIndexNeedsRebuild
+            && !_shuttingDown.load(std::memory_order_relaxed)) {
+            primeSurfacePatchIndicesAsync();
+        }
+    }, Qt::QueuedConnection);
 }
 
 void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate)
 {
+    if (name.empty()) {
+        // Empty-name notifications represent a completed bulk mutation of the
+        // surface catalog. Drop serialized deltas and rebuild once from the
+        // final CState snapshot instead of replaying thousands of updates.
+        _pendingSurfacePatchIndexTasks.clear();
+        _surfacesQueuedDuringRebuild.clear();
+        _pendingSurfacePatchIndexSurfaceIds.clear();
+        _deferredIndexSwap.reset();
+        _deferredIndexSwapIds.clear();
+        _indexedSurfaceIds.clear();
+        _surfacePatchIndexNeedsRebuild = true;
+        forEachBaseViewer([](VolumeViewerBase* v) {
+            v->invalidateIntersect();
+        });
+
+        // A single-surface task mutates the live index. Let it drain before
+        // launching the replacement build; its completion handler will prime.
+        const bool taskRunning =
+            _surfacePatchIndexTaskWatcher && _surfacePatchIndexTaskWatcher->isRunning();
+        if (!taskRunning) {
+            primeSurfacePatchIndicesAsync();
+        }
+        return;
+    }
+
     bool affectsSurfaceIndex = false;
     bool regionUpdated = false;
 

@@ -20,6 +20,8 @@
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
+#include <array>
+
 class QMdiArea;
 class QTimer;
 class AxisAlignedSliceController;
@@ -86,6 +88,17 @@ public:
     void setVolumeOverlay(VolumeOverlayController* overlay);
     void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
     InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
+
+    // Re-read the derived surface-cache settings. Called during manager
+    // construction and whenever the settings dialog applies.
+    void applyViewerCacheSettings();
+
+    // --- SurfaceCache budgets (flattened segmentation view) ---
+    //
+    // Zero disables a channel and leaves it on the legacy render path.
+    void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
+    std::size_t surfaceCacheBudgetBytes() const { return _surfaceCacheBudgetBytes; }
+    std::size_t overlaySurfaceCacheBudgetBytes() const { return _overlaySurfaceCacheBudgetBytes; }
 
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
@@ -233,6 +246,9 @@ signals:
     // Emitted whenever the user explicitly places the focus (Ctrl+click,
     // focus-on-cursor key, point activation, ...).
     void focusCenteredByUser(const cv::Vec3f& position);
+    // Emitted on Ctrl+Shift+click in a slice view when a patch lies under the
+    // clicked point; the owner should make that patch the active segment.
+    void surfaceActivationRequested(const std::string& surfaceId);
     // Aggregated per-viewer cache statistics (RAM / disk / network).
     void sharedCacheStatsChanged(const QStringList& items);
     void overlayWindowChanged(float low, float high);
@@ -277,6 +293,7 @@ private:
     bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
     void queueSurfacePatchIndexTask(SurfacePatchIndexTask task);
     void startNextSurfacePatchIndexTask();
+    void scheduleSurfacePatchIndexOverlayRefresh();
 
     CState* _state;
     VCCollection* _points;
@@ -319,6 +336,9 @@ private:
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
+    std::size_t _surfaceCacheBudgetBytes{0};
+    std::size_t _overlaySurfaceCacheBudgetBytes{0};
+
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
@@ -333,6 +353,9 @@ private:
     QString _surfacePatchIndexCacheKey;
     void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
+    // A first surface entering an empty index has no other builder.
+    bool _surfacePatchIndexPrimeQueued{false};
+    void schedulePrimeSurfacePatchIndices();
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;
     std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;
@@ -340,6 +363,7 @@ private:
     std::vector<SurfacePatchIndexTask> _surfacesQueuedDuringRebuild;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
     QFutureWatcher<SurfacePatchIndexTaskResult>* _surfacePatchIndexTaskWatcher{nullptr};
+    bool _surfacePatchIndexOverlayRefreshPending{false};
 
     // Surfaces currently pinned in the LRU as "highlighted/visible".
     // We track them so we can unpin the right set when highlights change.
