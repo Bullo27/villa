@@ -93,6 +93,15 @@ public:
         const utils::Json& metadata = {},
         bool discoverAwsCredentials = true);
 
+    // Voxel size in micrometers of the remote zarr at url, read from the
+    // store's meta.json (or the scanner's metadata.json) and rebased for a
+    // #vc-base-scale=N selector exactly like NewFromUrl. Lets tools that stream
+    // chunks without a Volume (vc_render_tifxyz) see the same value. Returns
+    // nullopt when the store carries no usable voxel size; throws on
+    // authentication and server errors.
+    static std::optional<double> remoteVoxelSize(
+        const std::string& url, const vc::HttpAuth& auth = {});
+
     // Construct a normal 3D Volume from a caller-prepared chunk source. The
     // source factory is invoked again when a cache is recreated. It must return
     // only 3D level descriptors; interpretation of higher-dimensional backing

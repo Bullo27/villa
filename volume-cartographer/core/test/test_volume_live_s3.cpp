@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace {
@@ -185,4 +186,40 @@ TEST_CASE("Volume::readXYZ: same region using XY-major order")
         return;
     }
     CHECK(ok);
+}
+
+TEST_CASE("Volume::remoteVoxelSize: meta.json, scanner metadata.json and base-scale rebasing")
+{
+    // PHerc 0172 ships a VC meta.json (voxelsize in um); PHerc 1447 ships only
+    // the scanner's metadata.json (samplePixelSize in mm). Both must come back
+    // in micrometers, for s3:// and https:// locators, and a #vc-base-scale=N
+    // selector scales the value the way NewFromUrl does.
+    struct Case {
+        const char* url;
+        double expected;
+    };
+    const Case cases[] = {
+        {kVolumeUrl, 7.91},
+        {"s3://vesuvius-challenge-open-data/PHerc0172/volumes/"
+         "20241024131838-7.910um-53keV-masked.zarr#vc-base-scale=1",
+         15.82},
+        {"https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/"
+         "PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr",
+         8.64},
+    };
+    // A transport failure makes the metadata GET look like a missing file, so
+    // probe the network through the regular open first to keep the soft-skip.
+    if (!openOrSkip()) return;
+    for (const auto& c : cases) {
+        std::optional<double> voxelSize;
+        try {
+            voxelSize = Volume::remoteVoxelSize(c.url);
+        } catch (const std::exception& e) {
+            if (requireNetwork()) FAIL("remoteVoxelSize failed: " << e.what());
+            MESSAGE("Skipping remoteVoxelSize (network unavailable?): " << e.what());
+            return;
+        }
+        REQUIRE_MESSAGE(voxelSize.has_value(), "no voxel size for " << c.url);
+        CHECK_MESSAGE(*voxelSize == doctest::Approx(c.expected), c.url);
+    }
 }

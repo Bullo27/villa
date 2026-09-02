@@ -1443,6 +1443,18 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     return vol;
 }
 
+std::optional<double> Volume::remoteVoxelSize(const std::string& url, const vc::HttpAuth& auth)
+{
+    const auto spec = vc::parseRemoteVolumeSpec(url);
+    const auto meta = loadRemoteVolumeMetadata(spec.sourceUrl, auth);
+    if (!meta || !meta->contains("voxelsize") || !(*meta)["voxelsize"].is_number())
+        return std::nullopt;
+    const double native = (*meta)["voxelsize"].get_double();
+    if (!std::isfinite(native) || native <= 0.0)
+        return std::nullopt;
+    return native * static_cast<double>(std::uint64_t{1} << spec.baseScaleLevel);
+}
+
 std::shared_ptr<Volume> Volume::NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata)
 {
     if (!sourceFactory)

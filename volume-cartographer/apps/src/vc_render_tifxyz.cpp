@@ -1073,6 +1073,19 @@ static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& vo
     return std::nullopt;
 }
 
+// Remote stores keep their voxel size next to the zarr root (meta.json or the
+// scanner's metadata.json); with --remote-url, --volume is only the local chunk
+// cache, so readVolumeVoxelSize() never sees it (#1403).
+static std::optional<double> readRemoteVoxelSize(const std::string& remoteUrl, const vc::HttpAuth& auth)
+{
+    try {
+        return Volume::remoteVoxelSize(remoteUrl, auth);
+    } catch (const std::exception& e) {
+        logPrintf(stderr, "Warning: could not read remote volume metadata: %s\n", e.what());
+        return std::nullopt;
+    }
+}
+
 // ============================================================
 // main
 // ============================================================
@@ -1368,10 +1381,11 @@ int main(int argc, char *argv[])
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
     vc::render::IChunkedArray* chunk_cache = nullptr;
+    vc::HttpAuth remoteAuth;
 
     if (useRemoteCache) {
         try {
-            vc::HttpAuth remoteAuth = vc::HttpAuth::from_env();
+            remoteAuth = vc::HttpAuth::from_env();
             ownedChunkCache = vc::render::createChunkCache(
                 vc::render::openHttpZarrPyramid(remoteUrl, remoteAuth),
                 cache_bytes);
@@ -1450,6 +1464,10 @@ int main(int argc, char *argv[])
         } else {
             logPrintf(stderr, "Warning: ignoring invalid metadata voxelsize; using default 1.0\n");
         }
+    } else if (auto rv = useRemoteCache ? readRemoteVoxelSize(remoteUrl, remoteAuth) : std::optional<double>{}; rv) {
+        base_voxel_size = *rv;
+        hasPhysicalVoxelSize = true;
+        logPrintf(stdout, "Voxel size (from remote volume metadata): %g %s\n", base_voxel_size, voxel_unit.c_str());
     } else {
         logPrintf(stdout, "Voxel size: 1.0 (no metadata found; override with --voxel-size)\n");
     }
